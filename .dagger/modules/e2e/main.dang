@@ -1,0 +1,261 @@
+"""
+End-to-end checks for the mypy toolchain.
+
+The fixtures under `.dagger/modules/e2e/fixtures/` are mypy projects, one per
+config file mypy reads (mypy.ini, .mypy.ini, pyproject.toml, setup.cfg), and
+one per way of declaring dependencies (a pyproject.toml [project] table, a
+requirements.txt, none). Some fail on purpose, so the checks here select them
+explicitly rather than running the whole collection.
+"""
+type E2e {
+  """
+  The git repository to type-check as an end-to-end smoke test.
+  """
+  repo: String! = "https://github.com/dagger/pytest"
+
+  let fixtures: String! = ".dagger/modules/e2e/fixtures"
+
+  let assert(condition: Boolean!, message: String!): Void {
+    if (condition == false) { raise message }
+    null
+  }
+
+  """
+  Run a check, raising its failure. A check called through a dependency comes
+  back as a Check that has not run.
+  """
+  let run(check: Check!): Void {
+    # Check.error is not null for a passing check when read from Dang, so ask
+    # pass first and read the message only on failure.
+    if (check.pass == false) {
+      raise check.error.message ?? "check failed"
+    }
+    null
+  }
+
+  """
+  The error a check fails with, or "unexpected success".
+  """
+  let failure(check: Check!): String! {
+    {
+      run(check)
+      "unexpected success"
+    } rescue {
+      err: Error => err.message
+    }
+  }
+
+  let same(got: [String!]!, want: [String!]!): Boolean! {
+    got.join("\n") == want.join("\n")
+  }
+
+  let fixture(name: String!): String! {
+    fixtures + "/" + name
+  }
+
+  """
+  Run the mypy toolchain against a real-world repository.
+
+  This pulls the pytest toolchain's repo, whose pytest_otel package carries a
+  strict [tool.mypy] table, a [project] table and a uv.lock, but lists mypy
+  only in an extra: so its dependencies are synced and the latest mypy is
+  installed beside them.
+  """
+  checkPytestRepo: Void @check {
+    let ws = git(repo).head.tree.asWorkspace
+    let projects = mypy.projects(ws)
+    assert(same(projects.keys, ["pytest_otel"]), "pytest projects: " + projects.keys.join(", "))
+    let verdict = failure(projects.batch.typeCheck(ws))
+    assert(
+      verdict == "unexpected success" or verdict.contains("mypy failed (exit 1)"),
+      "type-checking pytest_otel did not run to a verdict: " + verdict,
+    )
+  }
+
+  """
+  Discovery finds every config root, workspace-root-relative and sorted, from
+  any working directory.
+  """
+  discoveryCheck(ws: Workspace!): Void @check {
+    let root = ws.withWorkdir(".")
+    let all = mypy.projects(root).keys
+    # no-mypy holds a pyproject.toml without a [tool.mypy] table.
+    let expected = [
+      fixture("broken-install"),
+      fixture("clean"),
+      fixture("deps"),
+      fixture("dotted"),
+      fixture("envstubs"),
+      fixture("failing"),
+      fixture("files-config"),
+      fixture("own-mypy"),
+      fixture("parent"),
+      fixture("parent/nested"),
+      fixture("requirements"),
+      fixture("setupcfg"),
+    ]
+    assert(same(all, expected), "unexpected projects: " + all.join(", "))
+
+    # A project root sees itself and what is below it, not its enclosing one.
+    let parent = mypy.projects(root.withWorkdir(fixture("parent"))).keys
+    assert(
+      same(parent, [fixture("parent"), fixture("parent/nested")]),
+      "discovery from a project root: " + parent.join(", "),
+    )
+
+    # Inside a project's subdirectory, the enclosing project is the only one
+    # visible.
+    let inside = mypy.projects(root.withWorkdir(fixture("parent/lib"))).keys
+    assert(same(inside, [fixture("parent")]), "discovery inside a project: " + inside.join(", "))
+
+    # Configs in a virtualenv or node_modules are not projects.
+    let vendored = directory
+      .withNewFile("app/mypy.ini", "[mypy]\n")
+      .withNewFile("app/.venv/lib/dep/mypy.ini", "[mypy]\n")
+      .withNewFile("app/node_modules/tool/setup.cfg", "[mypy]\n")
+      .withNewFile("site-packages/pkg/pyproject.toml", "[tool.mypy]\nstrict = true\n")
+      .asWorkspace
+    let apps = mypy.projects(vendored).keys
+    assert(same(apps, ["app"]), "discovery entered an excluded tree: " + apps.join(", "))
+    null
+  }
+
+  """
+  get returns items by key, and a subset holds only its keys.
+  """
+  collectionCheck(ws: Workspace!): Void @check {
+    let projects = mypy.projects(ws.withWorkdir("."))
+    assert(projects.get(key: fixture("clean")).path == fixture("clean"), "get returned the wrong project")
+    let subset = projects.subset(keys: [fixture("parent"), fixture("clean")])
+    # A subset keeps the collection's order, whatever order it was asked in.
+    assert(same(subset.keys, [fixture("clean"), fixture("parent")]), "subset keys: " + subset.keys.join(", "))
+    null
+  }
+
+  """
+  Every config file mypy reads makes a project that passes when its code is
+  well typed, and a subset batch checks only its keys.
+  """
+  configFilesCheck(ws: Workspace!): Void @check {
+    let projects = mypy.projects(ws.withWorkdir("."))
+    run(
+      projects
+        .subset(keys: [fixture("clean"), fixture("dotted"), fixture("setupcfg"), fixture("files-config")])
+        .batch
+        .typeCheck(ws),
+    )
+    null
+  }
+
+  """
+  A failing project fails its own check and every batch it is in, with
+  mypy's own findings.
+  """
+  failureCheck(ws: Workspace!): Void @check {
+    let projects = mypy.projects(ws.withWorkdir("."))
+    let own = failure(projects.get(key: fixture("failing")).typeCheck(ws))
+    assert(
+      own.contains(fixture("failing") + ": mypy failed (exit 1)") and own.contains("Incompatible return value type"),
+      "the failing project's error did not name it and mypy's findings: " + own,
+    )
+    let batch = failure(projects.subset(keys: [fixture("clean"), fixture("failing")]).batch.typeCheck(ws))
+    assert(batch.contains(fixture("failing")), "the batch did not name the failing project: " + batch)
+    assert(batch.contains(fixture("clean") + ":") == false, "the batch blamed the clean project: " + batch)
+    null
+  }
+
+  """
+  A project leaves its nested projects to their own check: the strict parent
+  passes although the nested project's code is untyped, and the nested
+  project passes under its own, lenient config. The parent also passes
+  although generated/ is ill typed: its config excludes it, and the
+  --exclude that skips the nested project does not drop that.
+  """
+  nestedCheck(ws: Workspace!): Void @check {
+    let projects = mypy.projects(ws.withWorkdir("."))
+    run(projects.get(key: fixture("parent")).typeCheck(ws))
+    run(projects.get(key: fixture("parent/nested")).typeCheck(ws))
+    null
+  }
+
+  """
+  A config's files setting decides what is checked: files-config passes
+  although a file outside its src directory is ill typed.
+  """
+  filesCheck(ws: Workspace!): Void @check {
+    run(mypy.projects(ws.withWorkdir(".")).get(key: fixture("files-config")).typeCheck(ws))
+    null
+  }
+
+  """
+  Dependencies are installed before mypy runs: deps declares packaging in a
+  [project] table and requirements in a requirements.txt, and both import
+  it under strict mode, which fails on a missing import.
+  """
+  dependenciesCheck(ws: Workspace!): Void @check {
+    let projects = mypy.projects(ws.withWorkdir("."))
+    run(projects.subset(keys: [fixture("deps"), fixture("requirements")]).batch.typeCheck(ws))
+    null
+  }
+
+  """
+  The project's own mypy runs (own-mypy pins 2.3.1 in its dev group), and the
+  version setting overrides it. own-mypy fails on purpose, so the output
+  names the mypy that ran.
+  """
+  versionCheck(ws: Workspace!): Void @check {
+    let root = ws.withWorkdir(".")
+    let own = failure(mypy.projects(root).get(key: fixture("own-mypy")).typeCheck(ws))
+    assert(own.contains("(mypy 2.3.1"), "the project's own mypy did not run: " + own)
+    let forced = failure(mypy(version: "2.4.0").projects(root).get(key: fixture("own-mypy")).typeCheck(ws))
+    assert(forced.contains("(mypy 2.4.0"), "the version setting did not win: " + forced)
+    null
+  }
+
+  """
+  A failed install is reported as one, with its command, and installFlags
+  reach it.
+  """
+  installFailureCheck(ws: Workspace!): Void @check {
+    let root = ws.withWorkdir(".")
+    let broken = failure(mypy.projects(root).get(key: fixture("broken-install")).typeCheck(ws))
+    assert(
+      broken.contains(fixture("broken-install") + ": install failed (uv sync --no-install-project, exit"),
+      "an install failure was not reported as one: " + broken,
+    )
+    let flagged = failure(
+      mypy(installFlags: ["--no-dev"]).projects(root).get(key: fixture("broken-install")).typeCheck(ws),
+    )
+    assert(flagged.contains("(uv sync --no-install-project --no-dev, exit"), "installFlags were not used: " + flagged)
+    null
+  }
+
+  """
+  An image without uv fails with a message that says what to change.
+  """
+  missingUvCheck(ws: Workspace!): Void @check {
+    let missing = failure(
+      mypy(baseImageAddress: "python:3.13-slim").projects(ws.withWorkdir(".")).get(key: fixture("clean")).typeCheck(ws),
+    )
+    assert(
+      missing.contains("uv is not installed in the base image") and missing.contains("baseImageAddress"),
+      "an image without uv did not fail clearly: " + missing,
+    )
+    null
+  }
+
+  """
+  The environment setting reaches mypy: with MYPYPATH pointing at its stubs,
+  envstubs finds mylib and fails on its type; without, it cannot find it.
+  """
+  environmentCheck(ws: Workspace!): Void @check {
+    let root = ws.withWorkdir(".")
+    let without = failure(mypy.projects(root).get(key: fixture("envstubs")).typeCheck(ws))
+    assert(without.contains("Cannot find implementation or library stub"), "mylib was found without MYPYPATH: " + without)
+    let stubbed = failure(
+      mypy(environment: ["MYPYPATH=stubs"]).projects(root).get(key: fixture("envstubs")).typeCheck(ws),
+    )
+    assert(stubbed.contains("Incompatible types in assignment"), "MYPYPATH did not reach mypy: " + stubbed)
+    null
+  }
+}

@@ -1,0 +1,612 @@
+"""
+Type-check Python projects in a workspace with mypy.
+
+https://mypy-lang.org
+"""
+type Mypy {
+  """
+  The base image to use.
+  """
+  baseImageAddress: String!
+
+  """
+  The mypy version to run. Empty runs the project's own mypy.
+  """
+  version: String!
+
+  """
+  Extra arguments for the dependency install command.
+  """
+  installFlags: [String!]!
+
+  """
+  Environment variables for the install and for mypy, as KEY=VALUE.
+  """
+  environment: [String!]!
+
+  new(
+    """
+    Container image with uv and a Python the project supports, e.g.
+    "astral/uv:python3.11-bookworm-slim".
+    """
+    baseImageAddress: String! = "astral/uv:python3.13-bookworm-slim",
+    """
+    mypy version, e.g. "2.4.0". Empty runs the mypy the project's own
+    dependencies install, else the latest release.
+    """
+    version: String! = "",
+    """
+    Extra arguments for the dependency install command, e.g. ["--all-extras"]
+    for uv sync, or ["--no-deps"] for uv pip install.
+    """
+    installFlags: [String!]! = [],
+    """
+    Environment variables for the install and for mypy, as KEY=VALUE.
+    """
+    environment: [String!]! = [],
+  ) {
+    self.baseImageAddress = baseImageAddress
+    self.version = version
+    self.installFlags = installFlags
+    self.environment = environment
+    self
+  }
+
+  """
+  mypy projects at or below the working directory, keyed by config root.
+  """
+  projects(ws: Workspace!): MypyProjects! {
+    # One scan of the whole workspace serves discovery and every project's
+    # list of nested projects, so neither depends on where dagger runs.
+    let projects = sorted(configRoots(ws, ".").uniq)
+    let cwd = cwdPath(ws)
+    let below = projects.filter { project => isBelow(project, cwd) }
+    # Inside a project's subdirectory, the enclosing project is selected too.
+    let empty: [String!]! = []
+    let enclosing = if (below.any { project => project == cwd }) {
+      empty
+    } else {
+      let found = deepest(
+        projects.filter { project => project != cwd and isBelow(cwd, project) },
+      )
+      if (found == null) { empty } else { [found ?? "."] }
+    }
+    MypyProjects(paths: sorted(enclosing + below), roots: projects, tool: self)
+  }
+
+  """
+  Directories discovery never enters: virtual environments, caches, build
+  output and vendored trees, where a config belongs to someone else.
+  """
+  let skippedDirs: [String!]! {
+    [
+      ".eggs",
+      ".git",
+      ".mypy_cache",
+      ".nox",
+      ".tox",
+      ".venv",
+      "__pypackages__",
+      "build",
+      "dist",
+      "node_modules",
+      "site-packages",
+      "venv",
+    ]
+  }
+
+  """
+  Workspace-root-relative directories holding a mypy config at or below
+  start, plus the nearest enclosing one when start holds none.
+  """
+  let configRoots(ws: Workspace!, start: String!): [String!]! {
+    ws
+      .findRoots(
+        markers: ["mypy.ini", ".mypy.ini", "pyproject.toml", "setup.cfg"],
+        start: absolutePath(start),
+        exclude: skippedDirs.map { dir => "**/" + dir },
+      )
+      .map { dir => workspaceRootPath(ws, dir) }
+      .filter { dir => settings(ws, dir) != null }
+  }
+
+  """
+  The mypy settings text of the config in dir, or null when dir holds none.
+  mypy reads mypy.ini first, then .mypy.ini, then pyproject.toml, then
+  setup.cfg. For the INI files this is the [mypy] section; for
+  pyproject.toml, the [tool.mypy] table.
+  """
+  let settings(ws: Workspace!, dir: String!): String {
+    let prefix = if (dir == ".") { "" } else { dir + "/" }
+    if (hasFile(ws, prefix + "mypy.ini")) {
+      section(ws.file("/" + prefix + "mypy.ini").contents, "mypy]") ?? ""
+    } else if (hasFile(ws, prefix + ".mypy.ini")) {
+      section(ws.file("/" + prefix + ".mypy.ini").contents, "mypy]") ?? ""
+    } else if (hasFile(ws, prefix + "pyproject.toml")) {
+      section(ws.file("/" + prefix + "pyproject.toml").contents, "tool.mypy]")
+    } else if (hasFile(ws, prefix + "setup.cfg")) {
+      section(ws.file("/" + prefix + "setup.cfg").contents, "mypy]")
+    } else {
+      null
+    }
+  }
+
+  """
+  The body of the section whose header, without its opening bracket, is
+  header, or null when the text has none.
+  """
+  let section(text: String!, header: String!): String {
+    let sections = ("\n" + text).split("\n[").filter { s => s.hasPrefix(header) }
+    if (sections.length == 0) {
+      null
+    } else {
+      sections.map { s => s.trimPrefix(header) }.join("\n")
+    }
+  }
+
+  """
+  Whether the config names what to check (files, packages or modules). When
+  it does, mypy is run with no path, so the config decides.
+  """
+  let namesTargets(ws: Workspace!, dir: String!): Boolean! {
+    (settings(ws, dir) ?? "").containsMatch(`(?m)^\s*(files|packages|modules)\s*=`)
+  }
+
+  """
+  The literal exclude patterns of the config in dir: a string or an array of
+  strings in pyproject.toml, a single line in an INI file. Passing --exclude
+  on the command line replaces them, so they are passed along with it.
+  """
+  let excludePatterns(ws: Workspace!, dir: String!): [String!]! {
+    let text = settings(ws, dir) ?? ""
+    let empty: [String!]! = []
+    let arrays = text.matchAll(`(?m)^\s*exclude\s*=\s*\[([^\]]*)\]`)
+    if (arrays.length > 0) {
+      arrays.reduce(empty) { acc, array =>
+        acc + array.captures.join("").matchAll(`'([^']*)'|"([^"]*)"`).map { literal =>
+          literal.captures.join("")
+        }
+      }
+    } else {
+      let quoted = text.matchAll(`(?m)^\s*exclude\s*=\s*(?:'([^']*)'|"([^"]*)")\s*$`)
+      if (quoted.length > 0) {
+        quoted.map { m => m.captures.join("") }
+      } else {
+        text
+          .matchAll(`(?m)^\s*exclude\s*=\s*([^\s'"\[].*?)\s*$`)
+          .map { m => m.captures.join("") }
+      }
+    }
+  }
+
+  """
+  A regular expression matching a path relative to a project, for mypy's
+  --exclude.
+  """
+  let pathRegex(rel: String!): String! {
+    "^" + rel.replaceMatches(`[.+*?^$()\[\]{}|\\]`, with: "\\$0") + "/"
+  }
+
+  let hasFile(ws: Workspace!, file: String!): Boolean! {
+    ws.glob(file).length > 0
+  }
+
+  let project(path: String!, roots: [String!]!): MypyProject! {
+    MypyProject(path: path, roots: roots, tool: self)
+  }
+
+  """
+  Workspace-root-relative path of the caller's location.
+  """
+  let cwdPath(ws: Workspace!): String! {
+    workspaceRootPath(ws, ".")
+  }
+
+  """
+  Resolve a path relative to the caller's location, as findRoots returns
+  them, into a workspace-root-relative one, collapsing any leading "..".
+  """
+  let workspaceRootPath(ws: Workspace!, cwdRelPath: String!): String! {
+    let segments = cwdRelPath.split("/").filter { s => s != "" and s != "." }
+    let up = segments.filter { s => s == ".." }.length
+    let down = segments.filter { s => s != ".." }
+    let resolved = ws.cwd.split("/").filter { s => s != "" }.dropLast(up) + down
+    if (resolved.length == 0) { "." } else { resolved.join("/") }
+  }
+
+  """
+  Where a workspace-root-relative path is mounted in the mypy container.
+  """
+  let containerPath(path: String!): String! {
+    if (path == ".") { "/src" } else { "/src/" + path }
+  }
+
+  """
+  The workspace-absolute spelling of a workspace-root-relative path.
+  """
+  let absolutePath(path: String!): String! {
+    if (path == ".") { "/" } else { "/" + path }
+  }
+
+  """
+  Whether path is dir or below it.
+  """
+  let isBelow(path: String!, dir: String!): Boolean! {
+    dir == "." or path == dir or path.hasPrefix(dir + "/")
+  }
+
+  """
+  path relative to dir, which holds it.
+  """
+  let relativePath(path: String!, dir: String!): String! {
+    if (path == dir) { "." } else if (dir == ".") { path } else {
+      path.trimPrefix(dir + "/")
+    }
+  }
+
+  """
+  The workspace-root-relative directory of a workspace-absolute file path.
+  """
+  let dirOf(file: String!): String! {
+    let dir = file.trimPrefix("/").split("/").dropLast(1).join("/")
+    if (dir == "") { "." } else { dir }
+  }
+
+  let depth(dir: String!): Int! {
+    if (dir == ".") { 0 } else { dir.split("/").length }
+  }
+
+  """
+  The deepest of the given directories.
+  """
+  let deepest(dirs: [String!]!): String {
+    let none: String = null
+    dirs.reduce(none) { best, dir =>
+      if (best == null) { dir } else if (depth(dir) > depth(best ?? ".")) { dir } else { best }
+    }
+  }
+
+  let sorted(items: [String!]!): [String!]! {
+    let empty: [String!]! = []
+    items.reduce(empty) { acc, item =>
+      acc.takeWhile { x => x <= item } + [item] + acc.dropWhile { x => x <= item }
+    }
+  }
+}
+
+# Keep all Dang types in one source file until Dagger can convert Workspace
+# arguments for installed multi-file Dang modules. See dagger/dagger#13476.
+
+"""
+mypy projects in a workspace, keyed by config root.
+"""
+type MypyProjects @collection {
+  """
+  Project root paths.
+  """
+  paths: [String!]! @keys
+
+  """
+  Every mypy config root in the workspace.
+  """
+  let roots: [String!]!
+
+  let tool: Mypy!
+
+  """
+  The mypy project rooted at path.
+  """
+  project(path: String!): MypyProject! @get {
+    tool.project(path, roots)
+  }
+
+  """
+  Type-check the selected projects.
+  """
+  typeCheck(ws: Workspace!): Void @check {
+    # A selection over a list evaluates its elements concurrently, so every
+    # project is checked in parallel and every failure is reported.
+    let failures = paths.map { p => project(p) }.{{path, failure: typeCheckFailure(ws)}}
+      .filter { result => result.failure != null }
+    if (failures.length > 0) {
+      raise "mypy failed in " + toString(failures.length) + " of " + toString(paths.length)
+        + " projects:\n" + failures.map { result =>
+        "- " + result.path + ": " + (result.failure ?? "")
+      }.join("\n")
+    }
+    null
+  }
+}
+
+"""
+A mypy project rooted at the directory holding its config.
+"""
+type MypyProject {
+  """
+  Project root, relative to the workspace root.
+  """
+  path: String!
+
+  """
+  Every mypy config root in the workspace.
+  """
+  let roots: [String!]!
+
+  let tool: Mypy!
+
+  """
+  Type-check this project with mypy.
+  """
+  typeCheck(ws: Workspace!): Void @check {
+    let failure = typeCheckFailure(ws)
+    if (failure != null) {
+      raise path + ": " + (failure ?? "")
+    }
+    null
+  }
+
+  """
+  Why type-checking this project failed, naming the failing step, or null
+  when it passes. Each step runs with any exit code, so its failure is
+  reported as that step's.
+  """
+  let typeCheckFailure(ws: Workspace!): String {
+    let root = installRoot(ws)
+    let kind = installKind(ws, root)
+    let setup = setUp
+    let setupFailure = stepFailure("could not create the virtual environment", "", setup, 15)
+    if (setupFailure != null) {
+      setupFailure
+    } else {
+      let deps = dependencies(ws, setup, root, kind)
+      let depsFailure = if (kind == "project") {
+        stepFailure("install failed", (["uv", "sync", "--no-install-project"] + tool.installFlags).join(" "), deps, 15)
+      } else {
+        null
+      }
+      if (depsFailure != null) {
+        depsFailure
+      } else {
+        let installed = withProject(ws, deps, root, kind)
+        let projectFailure = if (kind == "project") {
+          stepFailure("install failed", (["uv", "sync"] + tool.installFlags).join(" "), installed, 15)
+        } else if (kind == "requirements") {
+          stepFailure(
+            "install failed",
+            (["uv", "pip", "install", "-r", "requirements.txt"] + tool.installFlags).join(" "),
+            installed,
+            15,
+          )
+        } else {
+          null
+        }
+        if (projectFailure != null) {
+          projectFailure
+        } else {
+          let withMypy = mypyInstalled(installed)
+          let mypyFailure = stepFailure("could not install mypy", mypyInstall.join(" "), withMypy, 15)
+          if (mypyFailure != null) {
+            mypyFailure
+          } else {
+            stepFailure("mypy failed", "", run(ws, withMypy), 30)
+          }
+        }
+      }
+    }
+  }
+
+  """
+  A failure message for an exec that ran with any exit code, or null when it
+  succeeded: the step, its command, its exit code and the last lines of its
+  output.
+  """
+  let stepFailure(step: String!, command: String!, ran: Container!, lines: Int!): String {
+    let code = ran.exitCode
+    if (code == 0) {
+      null
+    } else if (code == 127) {
+      # The setup explains itself when the image has no uv.
+      ran.stderr.trimSpace
+    } else {
+      let output = (ran.stderr + "\n" + ran.stdout).trimSpace.split("\n").takeLast(lines).join("\n")
+      let detail = if (command == "") { "" } else { command + ", " }
+      let tail = if (output == "") { "" } else { ":\n" + output }
+      step + " (" + detail + "exit " + toString(code) + ")" + tail
+    }
+  }
+
+  """
+  Where the project's dependencies are declared: the nearest directory at or
+  above this project whose pyproject.toml has a [project] table, else the
+  nearest one holding a requirements.txt, whichever is deeper. Null when
+  there is neither.
+  """
+  let installRoot(ws: Workspace!): String {
+    let from = tool.absolutePath(path)
+    let empty: [String!]! = []
+    let pyproject = projectRoot(ws, from)
+    let requirements = ws.findUp(name: "requirements.txt", from: from)
+    let candidates = (if (pyproject == null) { empty } else { [pyproject ?? "."] })
+      + (if (requirements == null) { empty } else { [tool.dirOf(requirements ?? "")] })
+    tool.deepest(candidates)
+  }
+
+  """
+  The nearest directory at or above from whose pyproject.toml has a
+  [project] table, or null.
+  """
+  let projectRoot(ws: Workspace!, from: String!): String {
+    let found = ws.findUp(name: "pyproject.toml", from: from)
+    if (found == null) {
+      null
+    } else {
+      let dir = tool.dirOf(found ?? "")
+      if (ws.file(found ?? "").contents.containsMatch(`(?m)^\[project\]`)) {
+        dir
+      } else if (dir == ".") {
+        null
+      } else {
+        projectRoot(ws, tool.absolutePath(tool.dirOf("/" + dir)))
+      }
+    }
+  }
+
+  """
+  How the install root declares its dependencies: "project" for a
+  pyproject.toml [project] table, "requirements" for a requirements.txt, or
+  "none".
+  """
+  let installKind(ws: Workspace!, root: String): String! {
+    if (root == null) {
+      "none"
+    } else {
+      let dir = root ?? "."
+      let prefix = if (dir == ".") { "" } else { dir + "/" }
+      if (tool.hasFile(ws, prefix + "pyproject.toml")
+        and ws.file("/" + prefix + "pyproject.toml").contents.containsMatch(`(?m)^\[project\]`)) {
+        "project"
+      } else {
+        "requirements"
+      }
+    }
+  }
+
+  """
+  The base image with uv's cache on a volume, every install going to one
+  virtual environment outside the source tree, and the environment setting.
+  """
+  let base: Container! {
+    let ctr = container
+      .from(tool.baseImageAddress)
+      .withMountedCache("/root/.cache/uv", cacheVolume("uv-cache"))
+      .withEnvVariable("UV_CACHE_DIR", "/root/.cache/uv")
+      # The cache volume is another filesystem, where uv cannot hard-link.
+      .withEnvVariable("UV_LINK_MODE", "copy")
+      .withEnvVariable("VIRTUAL_ENV", "/venv")
+      .withEnvVariable("UV_PROJECT_ENVIRONMENT", "/venv")
+      .withEnvVariable("NO_COLOR", "1")
+      .withEnvVariable("MYPY_FORCE_COLOR", "0")
+    tool.environment.reduce(ctr) { acc, pair =>
+      let key = pair.replaceMatches(`(?s)=.*$`, with: "")
+      acc.withEnvVariable(key, pair.trimPrefix(key + "="))
+    }
+  }
+
+  """
+  The virtual environment, created with the image's Python. An image without
+  uv fails here, saying what to change.
+  """
+  let setUp: Container! {
+    base.withExec(
+      [
+        "sh",
+        "-c",
+        "command -v uv >/dev/null 2>&1 || { echo 'uv is not installed in the base image: set baseImageAddress to an image with uv, such as astral/uv:python3.13-bookworm-slim' >&2; exit 127; }; uv venv --quiet /venv",
+      ],
+      expect: ReturnType.ANY,
+    )
+  }
+
+  """
+  For a pyproject.toml project, its dependencies installed from what the
+  install reads alone (every pyproject.toml, the lockfile, .python-version),
+  so editing source does not re-run it. Other kinds install with the source.
+  """
+  let dependencies(ws: Workspace!, setup: Container!, root: String, kind: String!): Container! {
+    if (kind == "project") {
+      let dir = root ?? "."
+      setup
+        .withDirectory(
+          tool.containerPath(dir),
+          ws.directory(
+            tool.absolutePath(dir),
+            include: ["**/pyproject.toml", "uv.lock", ".python-version"],
+            exclude: tool.skippedDirs.map { d => "**/" + d },
+          ),
+        )
+        .withWorkdir(tool.containerPath(dir))
+        .withExec(["uv", "sync", "--no-install-project"] + tool.installFlags, expect: ReturnType.ANY)
+    } else {
+      setup
+    }
+  }
+
+  """
+  The source mounted, and the project itself installed: uv sync for a
+  pyproject.toml project, uv pip install -r for a requirements.txt one.
+  """
+  let withProject(ws: Workspace!, deps: Container!, root: String, kind: String!): Container! {
+    let sourced = deps.withDirectory(
+      "/src",
+      ws.directory("/", exclude: ["**/.git", "**/.venv", "**/node_modules"], gitignore: true),
+    )
+    let dir = tool.containerPath(root ?? ".")
+    if (kind == "project") {
+      sourced.withWorkdir(dir).withExec(["uv", "sync"] + tool.installFlags, expect: ReturnType.ANY)
+    } else if (kind == "requirements") {
+      sourced
+        .withWorkdir(dir)
+        .withExec(["uv", "pip", "install", "-r", "requirements.txt"] + tool.installFlags, expect: ReturnType.ANY)
+    } else {
+      sourced
+    }
+  }
+
+  """
+  The mypy install command: the version setting, else mypy only when the
+  project's own dependencies did not install it.
+  """
+  let mypyInstall: [String!]! {
+    if (tool.version != "") {
+      ["uv", "pip", "install", "mypy==" + tool.version]
+    } else {
+      ["uv", "pip", "install", "mypy"]
+    }
+  }
+
+  let mypyInstalled(installed: Container!): Container! {
+    let command = mypyInstall.join(" ")
+    let script = if (tool.version != "") {
+      command
+    } else {
+      "[ -x /venv/bin/mypy ] || " + command
+    }
+    installed.withExec(["sh", "-c", script], expect: ReturnType.ANY)
+  }
+
+  """
+  Runs the virtual environment's mypy, so it sees every installed
+  dependency, and names its version in the output.
+  """
+  let runner: String! {
+    ```
+    #!/bin/sh
+    echo "+ mypy $* ($(/venv/bin/mypy --version))" >&2
+    exec /venv/bin/mypy "$@"
+    ```
+  }
+
+  """
+  mypy run in this project: on what its config names, else on the project
+  directory. Nested projects are checked on their own, with their own config,
+  so they are excluded here. --exclude on the command line replaces the
+  config's own exclude, so those patterns are passed along.
+  """
+  let run(ws: Workspace!, withMypy: Container!): Container! {
+    let nested = roots
+      .filter { dir => dir != path and tool.isBelow(dir, path) }
+      .map { dir => tool.relativePath(dir, path) }
+    let empty: [String!]! = []
+    let patterns = if (nested.length == 0) {
+      empty
+    } else {
+      tool.excludePatterns(ws, path) + nested.map { dir => tool.pathRegex(dir) }
+    }
+    let excludes = patterns.reduce(empty) { acc, pattern => acc + ["--exclude", pattern] }
+    let targets = if (tool.namesTargets(ws, path)) { empty } else { ["."] }
+    withMypy
+      .withNewFile("/usr/local/bin/dagger-mypy", runner, permissions: 493)
+      .withWorkdir(tool.containerPath(path))
+      .withExec(["dagger-mypy"] + targets + excludes, expect: ReturnType.ANY)
+  }
+}

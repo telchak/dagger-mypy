@@ -1,0 +1,8 @@
+[project]
+name = "broken-install"
+version = "0.0.0"
+requires-python = ">=3.10"
+dependencies = ["dagger-mypy-e2e-no-such-package"]
+
+[tool.mypy]
+strict = true

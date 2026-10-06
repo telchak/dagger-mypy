@@ -1,0 +1,2 @@
+# LF everywhere, whatever the checkout's OS or the machine's core.autocrlf.
+* text=auto eol=lf
