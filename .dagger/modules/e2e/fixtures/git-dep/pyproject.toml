@@ -1,0 +1,8 @@
+[project]
+name = "git-dep"
+version = "0.0.0"
+requires-python = ">=3.10"
+dependencies = ["packaging @ git+https://github.com/pypa/packaging.git@d8e3b31b734926ebbcaff654279f6855a73e052f"]
+
+[tool.mypy]
+strict = true

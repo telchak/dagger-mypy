@@ -90,6 +90,12 @@ The default image is `astral/uv:python3.13-bookworm-slim`, glibc rather than
 Alpine, since many packages publish no musl wheel. Set `baseImageAddress` to
 an image whose Python your project supports.
 
+A git dependency from a private repository needs a token. `gitToken` takes a
+secret, which git presents to `gitHost` (`github.com` by default) and to no
+other host. It reaches git through a credential helper declared in `GIT_CONFIG_*`
+variables, so it is written to no file, URL or `uv.lock`. The slim uv images
+have no git, so it is installed first when missing, with apt-get or apk.
+
 Failures name the project and the step:
 - `install failed (uv sync --no-install-project, exit 1)` with the end of
   uv's output;
@@ -155,6 +161,8 @@ settings.baseImageAddress = "astral/uv:python3.11-bookworm-slim"  # default: ast
 settings.version = "2.4.0"                                       # default: "" (the project's own, else latest)
 settings.installFlags = ["--all-extras"]                         # default: []; appended to uv sync or uv pip install
 settings.environment = ["MYPYPATH=stubs"]                        # default: []; KEY=VALUE for the install and mypy
+settings.gitToken = "env://GIT_TOKEN"                             # default: none; a secret for private git dependencies
+settings.gitHost = "github.com"                                   # default: "github.com"; the host gitToken is presented to
 ```
 
 Or from the CLI:

@@ -88,6 +88,7 @@ type E2e {
       fixture("envstubs"),
       fixture("failing"),
       fixture("files-config"),
+      fixture("git-dep"),
       fixture("own-mypy"),
       fixture("parent"),
       fixture("parent/nested"),
@@ -195,6 +196,21 @@ type E2e {
   dependenciesCheck(ws: Workspace!): Void @check {
     let projects = mypy.projects(ws.withWorkdir("."))
     run(projects.subset(keys: [fixture("deps"), fixture("requirements")]).batch.typeCheck(ws))
+    null
+  }
+
+  """
+  A git token installs git and reaches uv: git-dep takes packaging from its
+  public repository, which the slim default image cannot fetch without git.
+  git only offers the token when the host asks for credentials, and a public
+  repository never does, so a dummy one passes.
+  """
+  gitTokenCheck(ws: Workspace!): Void @check {
+    let root = ws.withWorkdir(".")
+    let without = failure(mypy.projects(root).get(key: fixture("git-dep")).typeCheck(ws))
+    assert(without.contains("Git executable not found"), "git-dep installed with no git: " + without)
+    let token = setSecret(name: "e2e-git-token", plaintext: "e2e-not-a-real-token")
+    run(mypy(gitToken: token).projects(root).get(key: fixture("git-dep")).typeCheck(ws))
     null
   }
 
